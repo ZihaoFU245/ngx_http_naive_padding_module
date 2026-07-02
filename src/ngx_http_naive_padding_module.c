@@ -182,11 +182,16 @@ ngx_http_naive_padding_request_body_filter(ngx_http_request_t *r,
     ngx_chain_t                    *out;
     ngx_http_naive_padding_ctx_t   *ctx;
 
+    ctx = ngx_http_naive_padding_get_ctx(r, 1);
+
     if (in == NULL) {
+        if (ctx != NULL && ctx->active && r->request_body != NULL) {
+            r->request_body->filter_need_buffering = 1;
+        }
+
         return ngx_http_next_request_body_filter(r, in);
     }
 
-    ctx = ngx_http_naive_padding_get_ctx(r, 1);
     if (ctx == NULL || !ctx->active
         || ctx->request_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST)
     {
@@ -505,10 +510,7 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
         last = b->last;
 
         if (pos == last) {
-            if (ngx_http_naive_padding_append_raw(r, &ll, b, pos, last,
-                                                  b->last_buf)
-                != NGX_OK)
-            {
+            if (ngx_http_naive_padding_append_buf(r, &ll, b) != NGX_OK) {
                 return NGX_ERROR;
             }
 
@@ -518,10 +520,9 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
         while (pos < last) {
 
             if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST) {
-                if (ngx_http_naive_padding_append_raw(r, &ll, b, pos, last,
-                                                      b->last_buf)
-                    != NGX_OK)
-                {
+                b->pos = pos;
+
+                if (ngx_http_naive_padding_append_buf(r, &ll, b) != NGX_OK) {
                     return NGX_ERROR;
                 }
 
@@ -555,6 +556,7 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
             nb->flush = b->flush;
 
             pos += payload_size;
+            b->pos = pos;
             ctx->response_count++;
 
             if (b->last_buf && pos == last) {
