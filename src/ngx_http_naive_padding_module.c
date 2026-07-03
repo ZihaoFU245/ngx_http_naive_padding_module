@@ -83,7 +83,8 @@ static ngx_http_request_body_filter_pt   ngx_http_next_request_body_filter;
 static ngx_command_t  ngx_http_naive_padding_commands[] = {
 
     { ngx_string("naive_padding"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
+                        |NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_naive_padding_loc_conf_t, enable),
