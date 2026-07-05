@@ -222,35 +222,75 @@ ngx_http_naive_padding_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
 #if (NGX_HTTP_V2)
-    h2_end_stream = 0;
+    if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST
+        && (r->http_version != NGX_HTTP_VERSION_20 || r->stream == NULL))
+    {
+        return ngx_http_next_body_filter(r, in);
+    }
 
     if (r->http_version == NGX_HTTP_VERSION_20 && r->stream != NULL) {
+        h2_end_stream = 0;
+
         for (cl = in; cl; cl = cl->next) {
             if (cl->buf->last_buf) {
                 h2_end_stream = 1;
                 break;
             }
         }
+
+        if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST) {
+            if (!h2_end_stream) {
+                return ngx_http_next_body_filter(r, in);
+            }
+
+            out = NULL;
+            ll = &out;
+
+            for (cl = in; cl; cl = cl->next) {
+                cl->buf->last_buf = 0;
+                cl->buf->last_in_chain = 0;
+
+                if (ngx_buf_size(cl->buf) == 0
+                    && !ngx_buf_special(cl->buf))
+                {
+                    continue;
+                }
+
+                if (ngx_http_naive_padding_append_buf(r, &ll, cl->buf)
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
+            }
+
+            in = out;
+            goto forward;
+        }
+
+    } else {
+        h2_end_stream = 0;
     }
 #else
     h2_end_stream = 0;
-#endif
 
-    if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST
-        && !h2_end_stream)
-    {
+    if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST) {
         return ngx_http_next_body_filter(r, in);
     }
+#endif
 
     out = NULL;
     rc = ngx_http_naive_padding_encode_response(r, ctx, in, &out,
-                                                h2_end_stream
-                                                ? &h2_end_stream : NULL);
+                                                 h2_end_stream
+                                                 ? &h2_end_stream : NULL);
     if (rc != NGX_OK) {
         return rc;
     }
 
-    rc = ngx_http_next_body_filter(r, out);
+    in = out;
+
+forward:
+
+    rc = ngx_http_next_body_filter(r, in);
     if (rc != NGX_OK) {
         return rc;
     }
@@ -501,7 +541,7 @@ ngx_http_naive_padding_decode_request(ngx_http_request_t *r,
         while (b->pos < b->last) {
 
             if (ctx->request_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST) {
-                nb = ngx_calloc_buf(r->pool);
+                nb = ngx_alloc_buf(r->pool);
                 if (nb == NULL) {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
@@ -557,7 +597,7 @@ ngx_http_naive_padding_decode_request(ngx_http_request_t *r,
             case ngx_http_naive_padding_read_payload:
                 n = ngx_min((size_t) (b->last - b->pos), ctx->payload_size);
 
-                nb = ngx_calloc_buf(r->pool);
+                nb = ngx_alloc_buf(r->pool);
                 if (nb == NULL) {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
@@ -594,18 +634,8 @@ ngx_http_naive_padding_decode_request(ngx_http_request_t *r,
             case ngx_http_naive_padding_read_discard:
                 n = ngx_min((size_t) (b->last - b->pos), ctx->padding_size);
 
-                while (n) {
-                    if (*b->pos != '\0') {
-                        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                                      "naive padding request contained "
-                                      "non-zero padding");
-                        return NGX_HTTP_BAD_REQUEST;
-                    }
-
-                    b->pos++;
-                    n--;
-                    ctx->padding_size--;
-                }
+                b->pos += n;
+                ctx->padding_size -= n;
 
                 if (ctx->padding_size == 0) {
                     ctx->request_count++;
@@ -686,34 +716,13 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
         while (pos < last) {
 
             if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST) {
-                if (b->last_buf && h2_end_stream != NULL) {
-                    nb = ngx_calloc_buf(r->pool);
-                    if (nb == NULL) {
-                        return NGX_ERROR;
-                    }
-
-                    *nb = *b;
-                    nb->tag = 0;
-                    nb->shadow = NULL;
-                    nb->recycled = 0;
-                    nb->last_shadow = 0;
-                    nb->pos = pos;
-                    nb->last = last;
-                    nb->last_buf = 0;
-                    nb->last_in_chain = 0;
-                    b->pos = last;
-                    *h2_end_stream = 1;
-
-                    if (ngx_http_naive_padding_append_buf(r, &ll, nb)
-                        != NGX_OK)
-                    {
-                        return NGX_ERROR;
-                    }
-
-                    break;
-                }
-
                 b->pos = pos;
+
+                if (b->last_buf && h2_end_stream != NULL) {
+                    b->last_buf = 0;
+                    b->last_in_chain = 0;
+                    *h2_end_stream = 1;
+                }
 
                 if (ngx_http_naive_padding_append_buf(r, &ll, b) != NGX_OK) {
                     return NGX_ERROR;
@@ -753,7 +762,7 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
 
                     } else {
                         nb = ngx_create_temp_buf(r->pool,
-                                                 NGX_HTTP_NAIVE_PADDING_HEADER_SIZE);
+                            NGX_HTTP_NAIVE_PADDING_HEADER_SIZE);
                         if (nb == NULL) {
                             return NGX_ERROR;
                         }
@@ -780,7 +789,7 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
                     body_last_buf = final_buf && padding_size == 0
                                     && h2_end_stream == NULL;
 
-                    nb = ngx_calloc_buf(r->pool);
+                    nb = ngx_alloc_buf(r->pool);
                     if (nb == NULL) {
                         return NGX_ERROR;
                     }
@@ -832,7 +841,7 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
                         b->last += n;
                         padding_size -= n;
 
-                        nb = ngx_calloc_buf(r->pool);
+                        nb = ngx_alloc_buf(r->pool);
                         if (nb == NULL) {
                             return NGX_ERROR;
                         }
