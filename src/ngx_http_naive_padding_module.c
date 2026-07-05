@@ -16,6 +16,8 @@
 #define NGX_HTTP_NAIVE_PADDING_MAX_PADDING      255
 #define NGX_HTTP_NAIVE_PADDING_RESPONSE_MIN     30
 #define NGX_HTTP_NAIVE_PADDING_RESPONSE_MAX     62
+#define NGX_HTTP_NAIVE_PADDING_H2_END_MIN       48
+#define NGX_HTTP_NAIVE_PADDING_H2_END_MAX       72
 
 
 typedef struct {
@@ -54,6 +56,8 @@ static char *ngx_http_naive_padding_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
 
 static ngx_int_t ngx_http_naive_padding_supported(ngx_http_request_t *r);
+static void ngx_http_naive_padding_clear_proxy_authenticate(
+    ngx_http_request_t *r);
 static ngx_int_t ngx_http_naive_padding_has_header(ngx_http_request_t *r);
 static ngx_http_naive_padding_ctx_t *ngx_http_naive_padding_get_ctx(
     ngx_http_request_t *r, ngx_uint_t create);
@@ -63,7 +67,7 @@ static ngx_int_t ngx_http_naive_padding_decode_request(
     ngx_chain_t *in, ngx_chain_t **out);
 static ngx_int_t ngx_http_naive_padding_encode_response(
     ngx_http_request_t *r, ngx_http_naive_padding_ctx_t *ctx,
-    ngx_chain_t *in, ngx_chain_t **out);
+    ngx_chain_t *in, ngx_chain_t **out, ngx_uint_t *h2_end_stream);
 static ngx_int_t ngx_http_naive_padding_append_raw(ngx_http_request_t *r,
     ngx_chain_t ***ll, ngx_buf_t *src, u_char *pos, u_char *last,
     ngx_uint_t last_buf);
@@ -71,6 +75,15 @@ static ngx_int_t ngx_http_naive_padding_append_last(ngx_http_request_t *r,
     ngx_chain_t ***ll);
 static ngx_int_t ngx_http_naive_padding_append_buf(ngx_http_request_t *r,
     ngx_chain_t ***ll, ngx_buf_t *b);
+#if (NGX_HTTP_V2)
+static ngx_int_t ngx_http_naive_padding_h2_wants_end_stream(
+    ngx_http_request_t *r, ngx_chain_t *in);
+static ngx_int_t ngx_http_naive_padding_h2_send_end_stream(
+    ngx_http_request_t *r);
+static ngx_int_t ngx_http_naive_padding_h2_send_last(ngx_http_request_t *r);
+static ngx_int_t ngx_http_naive_padding_h2_end_stream_handler(
+    ngx_http_v2_connection_t *h2c, ngx_http_v2_out_frame_t *frame);
+#endif
 
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
@@ -128,6 +141,12 @@ ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
 {
     ngx_http_naive_padding_ctx_t  *ctx;
 
+    if (r->method == NGX_HTTP_CONNECT
+        && r->headers_out.status == NGX_HTTP_NOT_ALLOWED)
+    {
+        ngx_http_naive_padding_clear_proxy_authenticate(r);
+    }
+
     if (r->headers_out.status != NGX_HTTP_OK) {
         return ngx_http_next_header_filter(r);
     }
@@ -152,6 +171,7 @@ ngx_http_naive_padding_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
     ngx_int_t                       rc;
     ngx_chain_t                    *out;
+    ngx_uint_t                      h2_end_stream;
     ngx_http_naive_padding_ctx_t   *ctx;
 
     if (in == NULL) {
@@ -159,19 +179,47 @@ ngx_http_naive_padding_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_naive_padding_module);
-    if (ctx == NULL || !ctx->active
-        || ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST)
+    if (ctx == NULL || !ctx->active) {
+        return ngx_http_next_body_filter(r, in);
+    }
+
+#if (NGX_HTTP_V2)
+    h2_end_stream = ngx_http_naive_padding_h2_wants_end_stream(r, in);
+#else
+    h2_end_stream = 0;
+#endif
+
+    if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST
+        && !h2_end_stream)
     {
         return ngx_http_next_body_filter(r, in);
     }
 
     out = NULL;
-    rc = ngx_http_naive_padding_encode_response(r, ctx, in, &out);
+    rc = ngx_http_naive_padding_encode_response(r, ctx, in, &out,
+                                                h2_end_stream
+                                                ? &h2_end_stream : NULL);
     if (rc != NGX_OK) {
         return rc;
     }
 
-    return ngx_http_next_body_filter(r, out);
+    rc = ngx_http_next_body_filter(r, out);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+#if (NGX_HTTP_V2)
+    if (h2_end_stream) {
+        rc = ngx_http_naive_padding_h2_send_end_stream(r);
+        if (rc == NGX_DECLINED) {
+            return ngx_http_naive_padding_h2_send_last(r);
+        }
+
+        return rc;
+    }
+#endif
+
+    return NGX_OK;
 }
 
 
@@ -236,6 +284,51 @@ ngx_http_naive_padding_supported(ngx_http_request_t *r)
 #endif
 
     return NGX_DECLINED;
+}
+
+
+static void
+ngx_http_naive_padding_clear_proxy_authenticate(ngx_http_request_t *r)
+{
+    u_char           *key;
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *header;
+
+    for (header = r->headers_out.proxy_authenticate; header;
+         header = header->next)
+    {
+        header->hash = 0;
+    }
+
+    r->headers_out.proxy_authenticate = NULL;
+
+    part = &r->headers_out.headers.part;
+    header = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                return;
+            }
+
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+
+        key = (header[i].lowcase_key != NULL) ? header[i].lowcase_key
+                                              : header[i].key.data;
+
+        if (header[i].key.len == sizeof("Proxy-Authenticate") - 1
+            && ngx_strncasecmp(key, (u_char *) "Proxy-Authenticate",
+                               sizeof("Proxy-Authenticate") - 1)
+               == 0)
+        {
+            header[i].hash = 0;
+        }
+    }
 }
 
 
@@ -496,7 +589,8 @@ ngx_http_naive_padding_decode_request(ngx_http_request_t *r,
 
 static ngx_int_t
 ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
-    ngx_http_naive_padding_ctx_t *ctx, ngx_chain_t *in, ngx_chain_t **out)
+    ngx_http_naive_padding_ctx_t *ctx, ngx_chain_t *in, ngx_chain_t **out,
+    ngx_uint_t *h2_end_stream)
 {
     size_t          payload_size, padding_size;
     u_char         *p, *pos, *last;
@@ -512,6 +606,11 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
         last = b->last;
 
         if (pos == last) {
+            if (b->last_buf && h2_end_stream != NULL) {
+                *h2_end_stream = 1;
+                continue;
+            }
+
             if (ngx_http_naive_padding_append_buf(r, &ll, b) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -522,6 +621,11 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
         while (pos < last) {
 
             if (ctx->response_count >= NGX_HTTP_NAIVE_PADDING_K_FIRST) {
+                if (b->last_buf && h2_end_stream != NULL) {
+                    *h2_end_stream = 1;
+                    b->last_buf = 0;
+                }
+
                 b->pos = pos;
 
                 if (ngx_http_naive_padding_append_buf(r, &ll, b) != NGX_OK) {
@@ -561,8 +665,12 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
             b->pos = pos;
             ctx->response_count++;
 
-            if (b->last_buf && pos == last) {
+            if (b->last_buf && pos == last && h2_end_stream == NULL) {
                 nb->last_buf = 1;
+            }
+
+            if (b->last_buf && pos == last && h2_end_stream != NULL) {
+                *h2_end_stream = 1;
             }
 
             if (ngx_http_naive_padding_append_buf(r, &ll, nb) != NGX_OK) {
@@ -573,6 +681,203 @@ ngx_http_naive_padding_encode_response(ngx_http_request_t *r,
 
     return NGX_OK;
 }
+
+
+#if (NGX_HTTP_V2)
+
+static ngx_int_t
+ngx_http_naive_padding_h2_wants_end_stream(ngx_http_request_t *r,
+    ngx_chain_t *in)
+{
+    ngx_chain_t  *cl;
+
+    if (r->http_version != NGX_HTTP_VERSION_20 || r->stream == NULL) {
+        return 0;
+    }
+
+    for (cl = in; cl; cl = cl->next) {
+        if (cl->buf->last_buf) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static ngx_int_t
+ngx_http_naive_padding_h2_send_end_stream(ngx_http_request_t *r)
+{
+    u_char                    *p;
+    size_t                     frame_size, range, total_size;
+    ngx_buf_t                 *b;
+    ngx_chain_t               *cl;
+    ngx_http_v2_stream_t      *stream;
+    ngx_http_v2_connection_t  *h2c;
+    ngx_http_v2_out_frame_t   *frame;
+
+    if (r->http_version != NGX_HTTP_VERSION_20 || r->stream == NULL
+        || !r->header_sent)
+    {
+        return NGX_DECLINED;
+    }
+
+    stream = r->stream;
+    h2c = stream->connection;
+
+    if (stream->out_closed || stream->rst_sent || h2c->connection->error) {
+        return NGX_DECLINED;
+    }
+
+    total_size = NGX_HTTP_NAIVE_PADDING_H2_END_MIN;
+    range = NGX_HTTP_NAIVE_PADDING_H2_END_MAX
+            - NGX_HTTP_NAIVE_PADDING_H2_END_MIN + 1;
+    total_size += ngx_random() % range;
+    frame_size = total_size - NGX_HTTP_V2_FRAME_HEADER_SIZE;
+
+    if (frame_size < 2 || frame_size - 1 > 255) {
+        return NGX_DECLINED;
+    }
+
+    if (h2c->send_window < frame_size
+        || stream->send_window < (ssize_t) frame_size)
+    {
+        return NGX_DECLINED;
+    }
+
+    frame = ngx_pcalloc(r->pool, sizeof(ngx_http_v2_out_frame_t));
+    if (frame == NULL) {
+        return NGX_ERROR;
+    }
+
+    cl = ngx_alloc_chain_link(r->pool);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    b = ngx_create_temp_buf(r->pool, total_size);
+    if (b == NULL) {
+        return NGX_ERROR;
+    }
+
+    b->tag = (ngx_buf_tag_t) &ngx_http_v2_module;
+    b->memory = 1;
+    b->flush = 1;
+    b->last_buf = 1;
+
+    p = b->last;
+    p = ngx_http_v2_write_len_and_type(p, frame_size, NGX_HTTP_V2_DATA_FRAME);
+    *p++ = NGX_HTTP_V2_END_STREAM_FLAG | NGX_HTTP_V2_PADDED_FLAG;
+    p = ngx_http_v2_write_sid(p, stream->node->id);
+    *p++ = (u_char) (frame_size - 1);
+    ngx_memzero(p, frame_size - 1);
+    p += frame_size - 1;
+    b->last = p;
+
+    cl->buf = b;
+    cl->next = NULL;
+
+    frame->first = cl;
+    frame->last = cl;
+    frame->handler = ngx_http_naive_padding_h2_end_stream_handler;
+    frame->stream = stream;
+    frame->length = frame_size;
+    frame->blocked = 0;
+    frame->fin = 1;
+
+    ngx_http_v2_queue_frame(h2c, frame);
+    h2c->send_window -= frame_size;
+    stream->send_window -= frame_size;
+    stream->queued++;
+
+    stream->blocked = 1;
+    if (ngx_http_v2_send_output_queue(h2c) == NGX_ERROR) {
+        r->connection->error = 1;
+        return NGX_ERROR;
+    }
+    stream->blocked = 0;
+
+    if (stream->queued) {
+        r->connection->buffered |= NGX_HTTP_V2_BUFFERED;
+        r->connection->write->active = 1;
+        r->connection->write->ready = 0;
+        return NGX_OK;
+    }
+
+    r->connection->buffered &= ~NGX_HTTP_V2_BUFFERED;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_naive_padding_h2_send_last(ngx_http_request_t *r)
+{
+    ngx_chain_t  *out, **ll;
+
+    out = NULL;
+    ll = &out;
+
+    if (ngx_http_naive_padding_append_last(r, &ll) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_http_next_body_filter(r, out);
+}
+
+
+static ngx_int_t
+ngx_http_naive_padding_h2_end_stream_handler(ngx_http_v2_connection_t *h2c,
+    ngx_http_v2_out_frame_t *frame)
+{
+    ngx_event_t          *wev;
+    ngx_chain_t          *cl;
+    ngx_connection_t     *fc;
+    ngx_http_request_t   *r;
+    ngx_http_v2_stream_t *stream;
+
+    if (frame->first->buf->pos != frame->first->buf->last) {
+        return NGX_AGAIN;
+    }
+
+    stream = frame->stream;
+    r = stream->request;
+    cl = frame->first;
+
+    r->connection->sent += NGX_HTTP_V2_FRAME_HEADER_SIZE + frame->length;
+    r->header_size += NGX_HTTP_V2_FRAME_HEADER_SIZE;
+    h2c->total_bytes += NGX_HTTP_V2_FRAME_HEADER_SIZE + frame->length;
+    h2c->payload_bytes += frame->length;
+
+    if (frame->fin) {
+        stream->out_closed = 1;
+    }
+
+    ngx_free_chain(r->pool, cl);
+
+    frame->next = stream->free_frames;
+    stream->free_frames = frame;
+    stream->queued--;
+
+    fc = r->connection;
+    if (stream->queued == 0 && !h2c->connection->buffered) {
+        fc->buffered &= ~NGX_HTTP_V2_BUFFERED;
+    }
+
+    if (!stream->waiting && !stream->blocked) {
+        wev = fc->write;
+        wev->active = 0;
+        wev->ready = 1;
+
+        if (fc->error || !wev->delayed) {
+            ngx_post_event(wev, &ngx_posted_events);
+        }
+    }
+
+    return NGX_OK;
+}
+
+#endif
 
 
 static ngx_int_t
