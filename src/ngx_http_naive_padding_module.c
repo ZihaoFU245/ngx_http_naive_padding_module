@@ -131,7 +131,10 @@ ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
     }
 
     if (r->headers_out.status != NGX_HTTP_OK
-        && r->headers_out.status != NGX_HTTP_NOT_ALLOWED)
+#if (HEADERS_MORE)
+        && r->headers_out.status != NGX_HTTP_NOT_ALLOWED
+#endif
+    )
     {
         return ngx_http_next_header_filter(r);
     }
@@ -141,6 +144,14 @@ ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
         return ngx_http_next_header_filter(r);
     }
 
+    /*
+     * Use `./configure ... --with-cc-opt='-DHEADERS_MORE=1 ...'
+     * to compile with clear 'Proxy-Authenticate' support. 
+     * This is for users who don't want to compile openResty's
+     * headers more module.
+     */
+    
+#if (HEADERS_MORE)
     if (r->headers_out.status == NGX_HTTP_NOT_ALLOWED)
     {
         ngx_http_clear_content_length(r);
@@ -187,6 +198,7 @@ ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
 
         return ngx_http_next_header_filter(r);
     }
+#endif
 
     if (!ctx->header_sent) {
         ngx_http_clear_content_length(r);
