@@ -120,10 +120,12 @@ ngx_module_t  ngx_http_naive_padding_module = {
 static ngx_int_t
 ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
 {
+#if (HEADERS_MORE)
     u_char                       *key;
     ngx_uint_t                    i;
     ngx_list_part_t              *part;
     ngx_table_elt_t              *header;
+#endif
     ngx_http_naive_padding_ctx_t  *ctx;
 
     if (r->method != NGX_HTTP_CONNECT) {
