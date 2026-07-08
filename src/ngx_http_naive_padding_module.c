@@ -22,6 +22,7 @@
 
 typedef struct {
     ngx_flag_t  enable;
+    ngx_flag_t  fast_connect;
 } ngx_http_naive_padding_loc_conf_t;
 
 
@@ -32,7 +33,8 @@ typedef struct {
     ngx_uint_t  response_count;
     ngx_uint_t  read_state;
     unsigned    active:1;
-    unsigned    header_sent:1;
+    unsigned    fast_connect:1;
+    unsigned    fast_connect_header_sent:1;
 } ngx_http_naive_padding_ctx_t;
 
 
@@ -50,6 +52,8 @@ static ngx_int_t ngx_http_naive_padding_supported(ngx_http_request_t *r);
 static ngx_int_t ngx_http_naive_padding_has_header(ngx_http_request_t *r);
 static ngx_http_naive_padding_ctx_t *ngx_http_naive_padding_get_ctx(
     ngx_http_request_t *r, ngx_uint_t create);
+static ngx_int_t ngx_http_naive_padding_send_fast_connect_header(
+    ngx_http_request_t *r, ngx_http_naive_padding_ctx_t *ctx);
 static ngx_int_t ngx_http_naive_padding_add_header(ngx_http_request_t *r);
 static ngx_int_t ngx_http_naive_padding_decode_request(
     ngx_http_request_t *r, ngx_http_naive_padding_ctx_t *ctx,
@@ -75,11 +79,19 @@ static ngx_http_request_body_filter_pt   ngx_http_next_request_body_filter;
 static ngx_command_t  ngx_http_naive_padding_commands[] = {
 
     { ngx_string("naive_padding"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
-                        |NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+      |NGX_HTTP_LIF_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_naive_padding_loc_conf_t, enable),
+      NULL },
+
+    { ngx_string("naive_fast_connect"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+      |NGX_HTTP_LIF_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_naive_padding_loc_conf_t, fast_connect),
       NULL },
 
       ngx_null_command
@@ -132,17 +144,34 @@ ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
         return ngx_http_next_header_filter(r);
     }
 
+    ctx = ngx_http_naive_padding_get_ctx(r, 1);
+    if (ctx == NULL || !ctx->active) {
+        return ngx_http_next_header_filter(r);
+    }
+
+    /*
+     * Fast CONNECT already emitted the 200 response.  Suppress the later
+     * upstream-generated header before it reaches the protocol header filter,
+     * but leave the upstream success path intact so it can switch to upgrade.
+     */
+    if (ctx->fast_connect_header_sent) {
+        r->header_sent = 1;
+
+        if (r->headers_out.status != NGX_HTTP_OK) {
+            r->header_only = 1;
+            r->keepalive = 0;
+            ngx_http_clear_content_length(r);
+        }
+
+        return NGX_OK;
+    }
+
     if (r->headers_out.status != NGX_HTTP_OK
 #if (HEADERS_MORE)
         && r->headers_out.status != NGX_HTTP_NOT_ALLOWED
 #endif
     )
     {
-        return ngx_http_next_header_filter(r);
-    }
-
-    ctx = ngx_http_naive_padding_get_ctx(r, 1);
-    if (ctx == NULL || !ctx->active) {
         return ngx_http_next_header_filter(r);
     }
 
@@ -202,14 +231,10 @@ ngx_http_naive_padding_header_filter(ngx_http_request_t *r)
     }
 #endif
 
-    if (!ctx->header_sent) {
-        ngx_http_clear_content_length(r);
+    ngx_http_clear_content_length(r);
 
-        if (ngx_http_naive_padding_add_header(r) != NGX_OK) {
-            return NGX_ERROR;
-        }
-
-        ctx->header_sent = 1;
+    if (ngx_http_naive_padding_add_header(r) != NGX_OK) {
+        return NGX_ERROR;
     }
 
     return ngx_http_next_header_filter(r);
@@ -353,6 +378,13 @@ ngx_http_naive_padding_request_body_filter(ngx_http_request_t *r,
     if (in == NULL) {
         if (ctx != NULL && ctx->active && r->request_body != NULL) {
             r->request_body->filter_need_buffering = 1;
+
+            if (ctx->fast_connect && !ctx->fast_connect_header_sent) {
+                rc = ngx_http_naive_padding_send_fast_connect_header(r, ctx);
+                if (rc != NGX_OK) {
+                    return rc;
+                }
+            }
         }
 
         return ngx_http_next_request_body_filter(r, in);
@@ -444,7 +476,8 @@ ngx_http_naive_padding_has_header(ngx_http_request_t *r)
 static ngx_http_naive_padding_ctx_t *
 ngx_http_naive_padding_get_ctx(ngx_http_request_t *r, ngx_uint_t create)
 {
-    ngx_http_naive_padding_ctx_t  *ctx;
+    ngx_http_naive_padding_ctx_t       *ctx;
+    ngx_http_naive_padding_loc_conf_t  *conf;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_naive_padding_module);
     if (ctx != NULL || !create) {
@@ -455,6 +488,8 @@ ngx_http_naive_padding_get_ctx(ngx_http_request_t *r, ngx_uint_t create)
         return NULL;
     }
 
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_naive_padding_module);
+
     ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_naive_padding_ctx_t));
     if (ctx == NULL) {
         return NULL;
@@ -462,11 +497,46 @@ ngx_http_naive_padding_get_ctx(ngx_http_request_t *r, ngx_uint_t create)
 
     if (ngx_http_naive_padding_has_header(r) == NGX_OK) {
         ctx->active = 1;
+        ctx->fast_connect = conf->fast_connect ? 1 : 0;
     }
 
     ngx_http_set_ctx(r, ctx, ngx_http_naive_padding_module);
 
     return ctx;
+}
+
+
+static ngx_int_t
+ngx_http_naive_padding_send_fast_connect_header(ngx_http_request_t *r,
+    ngx_http_naive_padding_ctx_t *ctx)
+{
+    ngx_int_t  rc;
+
+    if (r->header_sent) {
+        return NGX_OK;
+    }
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.status_line.len = 0;
+    r->headers_out.content_length_n = -1;
+
+    ngx_http_clear_content_length(r);
+
+    /*
+     * This runs the complete header filter chain synchronously.  Only after it
+     * returns do we clear r->header_sent so upstream can continue to its normal
+     * CONNECT process_header/send_response/upgrade path.
+     */
+    rc = ngx_http_send_header(r);
+
+    if (rc == NGX_ERROR || rc > NGX_OK) {
+        return rc;
+    }
+
+    ctx->fast_connect_header_sent = 1;
+    r->header_sent = 0;
+
+    return NGX_OK;
 }
 
 
@@ -1111,6 +1181,7 @@ ngx_http_naive_padding_create_loc_conf(ngx_conf_t *cf)
     }
 
     conf->enable = NGX_CONF_UNSET;
+    conf->fast_connect = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -1124,6 +1195,7 @@ ngx_http_naive_padding_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_http_naive_padding_loc_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    ngx_conf_merge_value(conf->fast_connect, prev->fast_connect, 0);
 
     return NGX_CONF_OK;
 }
